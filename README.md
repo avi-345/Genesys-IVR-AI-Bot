@@ -18,6 +18,11 @@ Account Management
 Human Escalation
 General Support
 
+## API Endpoints
+- GET /health — service health check
+- POST /ask — send message, get AI response
+- POST /end-session — end conversation + get summary
+
 ## Tech Stack
 Python
 Groq API (Llama 3.3 70b)

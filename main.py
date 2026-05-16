@@ -1,8 +1,17 @@
 import os
 from dotenv import load_dotenv
 from groq import Groq
+from fastapi import FastAPI
+from pydantic import BaseModel
+
 
 load_dotenv()
+
+app = FastAPI(
+    title="IntentRouting",
+    version="1.0",
+    description="IntentRouting",
+)
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -19,6 +28,23 @@ DEPARTMENT_PROMPTS = {
 # Intent detection prompt
 INTENT_PROMPT = "Detect the intent from the message and return ONLY one word from this list: TAX, ACCOUNT, BALANCE, ESCALATE, GENERAL, QUIT Return nothing else. Just the one word."
 
+#Pydantic Model and Session Storage for Memory
+sessions = {}
+
+class AskRequest(BaseModel):
+    message: str
+    session_id: str = "default"
+
+class AskResponse(BaseModel):
+    intent: str
+    department: str
+    response: str
+    session_id: str
+    escalate_count: int
+    total_messages: int
+
+class EndRequest(BaseModel):
+    session_id: str
 
 def detect_intent(user_message):
     """Detects intent from user message — returns one word"""
@@ -49,89 +75,82 @@ def get_department_response(intent, conversation_history):
     )
     return response.choices[0].message.content
 
+#FASTAPI Endpoints
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-def main():
-    print("=" * 50)
-    print("   Welcome to Genesys AI Assistant")
-    print("=" * 50)
-    print("Type 'quit' to exit\n")
+@app.post("/chat", response_model=AskResponse)
+def ask(request: AskRequest):
 
-    # Conversation history — separate from intent detection
-    conversation_history = []
-    current_intent = None
-    escalate_count = 0
-    no_input_count = 0
+    #Create Session
+    if request.session_id not in sessions:
+        sessions[request.session_id] = {
+            "history": [],
+            "current_intent": None,
+            "escalate_count": 0
+        }
+    session = sessions[request.session_id]
 
-    while True:
-        user_input = input("You: ").strip()
+    intent = detect_intent(request.message)
 
-        if not user_input:
-            if no_input_count <= 2:
-                no_input_count += 1
-                print("Sorry we didn't get any input from you, please try again")
-                continue
-            else:
-                print("Sorry we didn't get any input from you, we are disconnecting")
-                break
+    if intent == "ESCALATE":
+        session["escalate_count"] += 1
+        if session["escalate_count"] > 3:
+            return AskResponse(
+                intent="ESCALATE",
+                department="HUMAN AGENT",
+                response="Transferring you to a human agent now. Thank you for holding.",
+                session_id = request.session_id,
+                escalate_count = session["escalate_count"],
+                total_messages = len(session["history"])
+            )
+    session["current_intent"] = intent
 
-        if user_input.lower() == "quit":
-            # Print summary before exit
-            print("\n" + "=" * 50)
-            print("Session Summary:")
-            print(f"Total messages: {len(conversation_history)}")
-            if current_intent:
-                messages = [
-                                {"role": "system", "content": DEPARTMENT_PROMPTS["QUIT"]}
-                            ] + conversation_history + [
-                                {"role": "user", "content": "Please summarize our conversation"}
-                            ]
+    session["history"].append({
+        "role": "user",
+        "content": request.message
+    })
 
-                response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=messages
-                )
-                summary = response.choices[0].message.content
-                print(f"Summary of the conversation: {summary}")
-            print("Thank you for contacting us. Goodbye!")
-            print("=" * 50)
-            break
+    ai_response = get_department_response(intent, session["history"])
 
-        # Detect intent
-        intent = detect_intent(user_input)
+    return AskResponse(
+        intent=intent,
+        department=intent,
+        response=ai_response,
+        session_id = request.session_id,
+        escalate_count = session["escalate_count"],
+        total_messages = len(session["history"])
+    )
 
-        if intent == "ESCALATE":
-            if escalate_count <= 2:
-                escalate_count += 1
-            else:
-                print("""
-                Transferring you to an Agent, please wait...
-                Agent is connected now, thank you for holding
-                """)
-                break
+@app.post("/end-session")
+def end_session(request: EndRequest):
+    if request.session_id not in sessions:
+        return {"error": "Session not found"}
 
-        # If intent changed — notify user
-        if intent != current_intent:
-            current_intent = intent
-            print(f"\n[Routing to {intent} Department...]")
+    session = sessions[request.session_id]
 
-        # Add user message to history
-        conversation_history.append({
-            "role": "user",
-            "content": user_input
-        })
-
-        # Get department response
-        ai_response = get_department_response(
-            current_intent,
-            conversation_history
+    # Generate summary
+    summary = "No conversation to summarize."
+    if session["history"]:
+        messages = [
+            {"role": "system", "content": DEPARTMENT_PROMPTS["QUIT"]}
+        ] + session["history"] + [
+            {"role": "user", "content": "Please summarize this conversation"}
+        ]
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages
         )
+        summary = response.choices[0].message.content
 
-        # Add AI response to history
-        conversation_history.append({
-            "role": "assistant",
-            "content": ai_response
-        })
+    # Clean up session
+    total = len(session["history"])
+    del sessions[request.session_id]
 
-        print(f"\n🤖 Assistant: {ai_response}\n")
-
-main()
+    return {
+        "session_id": request.session_id,
+        "total_messages": total,
+        "summary": summary,
+        "status": "Session ended"
+    }
